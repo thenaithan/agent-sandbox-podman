@@ -1,0 +1,46 @@
+# agent-pod-verify run inside the original creatorpod setup (before hardening), 2026-10-15.
+# Run directly, not via 'agent-pod verify', so the loopback check has no listener. Home paths replaced with ~.
+FAIL  running as root inside the pod
+FAIL  capability bounding set too wide: CapBnd=00000000800405fb (expected 0000000000000000)
+PASS  no ambient capabilities
+FAIL  no_new_privs is not set
+FAIL  unexpected mounts: /sys/kernel/security (securityfs, source root /);
+        /sys/fs/cgroup (cgroup2, source root /../../../../..);
+        /sys/fs/pstore (pstore, source root /);
+        /sys/firmware/efi/efivars (efivarfs, source root /);
+        /sys/fs/bpf (bpf, source root /);
+        /sys/kernel/config (configfs, source root /);
+        /sys/kernel/debug (debugfs, source root /);
+        /sys/kernel/tracing (tracefs, source root /);
+        /sys/fs/fuse/connections (fusectl, source root /);
+        /root/.gitconfig (btrfs, source root ~/.gitconfig);
+        /tmp/wayland-0 (tmpfs, source root /wayland-0);
+        /root/.gemini (btrfs, source root ~/.gemini);
+        /root/.antigravity (btrfs, source root ~/.antigravity);
+        /root/.creatorpod-rc (btrfs, source root ~/.creatorpod-rc);
+        /root/.bashrc.host (btrfs, source root ~/.bashrc);
+        /root/.Xauthority (tmpfs, source root /xauth_XXXX);
+        /root/.claude (btrfs, source root ~/.claude);
+        /root/.codex (btrfs, source root ~/.codex);
+        /root/.claude.json (btrfs, source root ~/.claude.json);
+        /tmp/.X11-unix (tmpfs, source root /.X11-unix);
+        /run/docker.sock (tmpfs, source root /podman/podman.sock);
+        /root/.config/Antigravity (btrfs, source root ~/.config/Antigravity);
+        /root/.gemini/antigravity-cli/settings.json (btrfs, source root ~/.gemini/antigravity-cli/settings.json);
+        /root/.local/share/keyrings (btrfs, source root ~/.creatorpod-keyrings);
+        /var/lib/docker/volumes (btrfs, source root ~/.creatorpod-docker-volumes);
+        ~/projects/example (btrfs, source root ~/dev/clients/me/research);
+        
+FAIL  root filesystem not mounted read-only (options: rw,nodev,noatime)
+FAIL  unexpected unix sockets: /run/docker.sock /tmp/.X11-unix/X1 /tmp/.X11-unix/X0 /tmp/cc-socks/N.sock /tmp/wayland-0
+FAIL  display server socket or variable present
+PASS  limit pids.max: 2048
+FAIL  no limit memory.max (max)
+FAIL  no limit cpu.max (max)
+FAIL  VERIFY_HOST_PORT unset;
+        run via 'agent-pod verify'
+PASS  claude runs (2.1.301 (Claude Code))
+PASS  can reach api.anthropic.com:443
+WARN  egress is not filtered: the pod can reach the internet, your LAN and the host's LAN address
+
+10 check(s) failed.

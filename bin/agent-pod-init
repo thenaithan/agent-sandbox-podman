@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Entrypoint. On a project's first start the home volume has no ~/.claude.json,
+# so Claude Code would run its first-run setup. Seed it with onboarding state
+# only (no account, tokens or project history); login stays per project.
+set -euo pipefail
+[[ -e "$HOME/.claude.json" ]] || install -m 0600 /etc/agent-pod/claude-seed.json "$HOME/.claude.json"
+exec "$@"

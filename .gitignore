@@ -1,0 +1,7 @@
+.env
+.env.*
+*.key
+*.pem
+
+# Local notes, never published
+*.local.md

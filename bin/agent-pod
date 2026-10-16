@@ -1,0 +1,394 @@
+#!/usr/bin/env bash
+# agent-pod: run a coding agent in a rootless Podman container that can see
+# one project directory and nothing else from the host.
+set -euo pipefail
+
+readonly IMAGE_NAME="${AGENT_POD_IMAGE:-localhost/agent-pod}"
+readonly MEMORY="${AGENT_POD_MEMORY:-8g}"
+readonly CPUS="${AGENT_POD_CPUS:-4}"
+readonly PIDS="${AGENT_POD_PIDS:-1024}"
+readonly TOKEN_FILE="${AGENT_POD_TOKEN_FILE:-$HOME/.config/agent-pod/claude-token}"
+readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Shared Claude Code config, mounted read-only so the agent can use your rules,
+# skills, agents and plugins but cannot rewrite them for every later session.
+readonly CLAUDE_SHARED=(
+    agents commands rules skills plugins hooks scripts ecc mcp-configs .agents
+    settings.json CLAUDE.md AGENTS.md plugin.json marketplace.json
+)
+
+die() { echo "agent-pod: $*" >&2; exit 1; }
+
+usage() {
+    cat <<'EOF'
+Usage: agent-pod <command> [options] <project-dir> [-- command...]
+
+Commands:
+  build                 Build both images (base and browser) from the Containerfile
+  run [opts] <dir>      Start an interactive pod with <dir> mounted at /workspace
+  verify [opts] <dir>   Start a pod with the same settings as `run` and test its isolation
+  shell <dir> [-- cmd]  Open another shell (or run cmd) in the RUNNING pod for <dir>,
+                        with the same settings, mounts and environment as `run`
+  stop <dir>            Stop the running pod for <dir>
+  secret <dir> NAME     Hand a secret to the RUNNING pod for <dir>, as a file at
+                        /tmp/.agent-secrets/NAME (gone when the pod stops). The value
+                        comes from host variable NAME if exported, else from stdin or a
+                        silent prompt
+  reset <dir>           Delete the pod's home volume (agent login, caches, history)
+  config                Maintenance shell with ~/.claude mounted READ-WRITE and no
+                        project, for installing or updating plugins and skills
+  destroy               Remove all agent-pod containers, volumes and images
+
+Options for run and verify:
+  --ssh                 Forward the host SSH agent into the pod
+  --containers          Allow nested rootless Podman inside the pod (weaker profile, see README)
+  --browser             Use the image with Google Chrome (headless) and a larger /dev/shm
+  --clean               Do not mount your ~/.claude config or this project's memory
+  --login               Pass your Claude login token (from `claude setup-token`) instead
+                        of logging in per project; read from AGENT_POD_TOKEN_FILE
+  --secret NAME         Pass the host environment variable NAME into the pod; repeat
+                        for several. The variable must be set and exported on the host
+
+Environment:
+  AGENT_POD_MEMORY (8g)  AGENT_POD_CPUS (4)  AGENT_POD_PIDS (1024)
+  AGENT_POD_TOKEN_FILE (~/.config/agent-pod/claude-token)  token file for --login
+  ANTHROPIC_API_KEY      passed through if set; otherwise log in inside the pod
+EOF
+}
+
+# Resolve and sanity-check the project directory. Refuse / , the home
+# directory or any ancestor of it, and dot-directories that hold credentials.
+resolve_project() {
+    local dir="${1:-}" home
+    [[ -n "$dir" ]] || die "missing <project-dir>"
+    [[ -d "$dir" ]] || die "not a directory: $dir"
+    dir="$(cd "$dir" && pwd -P)"
+    home="$(cd "$HOME" && pwd -P)"
+    [[ "$dir" != / ]] || die "refusing to mount /"
+    if [[ "$home" == "$dir" || "$home" == "$dir"/* ]]; then
+        die "refusing to mount $dir: it contains your home directory"
+    fi
+    case "$dir" in
+        "$home"/.*) die "refusing to mount $dir: dot-directories in \$HOME often hold credentials" ;;
+    esac
+    printf '%s\n' "$dir"
+}
+
+# Stable per-project name: basename plus a short hash of the full path, so two
+# projects with the same name never share a home volume.
+project_slug() {
+    local dir="$1" name hash
+    name="$(basename "$dir" | tr -c 'a-zA-Z0-9_.-' '-' | cut -c1-40)"
+    hash="$(printf '%s' "$dir" | sha256sum | cut -c1-8)"
+    printf '%s-%s\n' "${name%-}" "$hash"
+}
+
+# The single source of truth for pod settings. `run` and `verify` both use it,
+# so what verify tests is exactly what run starts.
+# Args: <dir> <slug> <tty: true|false> <name>; reads the OPT_* flags.
+build_run_args() {
+    local dir="$1" slug="$2" tty="$3" name="$4" git_name git_email
+    RUN_ARGS=( run --rm -i )
+    [[ "$tty" == true ]] && RUN_ARGS+=( -t )
+    RUN_ARGS+=(
+        --name "$name"
+        --hostname "agent-pod"
+        --label agent-pod=1
+        # Identity: the host user maps to uid 1000 inside; no root in the pod.
+        --userns=keep-id:uid=1000,gid=1000
+        --cap-drop=ALL
+        # Filesystem: read-only image, tmpfs for /tmp and /run, one project mount,
+        # and a per-project home volume that holds the agent's own state.
+        --read-only
+        -v "$dir:/workspace:z"
+        -v "agent-pod-home-$slug:/home/agent"
+        # Network: own namespace via pasta, without the gateway-to-host-loopback mapping.
+        --network=pasta:--no-map-gw
+        # Resources
+        --memory "$MEMORY" --cpus "$CPUS" --pids-limit "$PIDS"
+        --workdir /workspace
+    )
+    [[ "$OPT_CLEAN" == true ]] || add_claude_config_args "$dir"
+    if [[ "$OPT_BROWSER" == true ]]; then
+        # Chrome's sandbox chroots itself to drop filesystem access, and Podman's
+        # default seccomp profile only allows chroot(2) with CAP_SYS_CHROOT.
+        # Without it the zygote crashes. no-new-privileges still blocks the
+        # classic chroot + setuid-binary escalation.
+        RUN_ARGS+=( --shm-size=1g --cap-add=SYS_CHROOT -e AGENT_POD_BROWSER=1 )
+    fi
+    if [[ "$OPT_CONTAINERS" == true ]]; then
+        # Nested rootless Podman needs newuidmap/newgidmap (file capabilities,
+        # so no no-new-privileges), SETUID/SETGID inside the user namespace,
+        # and FUSE for overlay storage. Images and containers live in the home
+        # volume; the host's Podman socket is still never mounted.
+        echo "agent-pod: --containers relaxes the profile (CAP_SETUID/SETGID, /dev/fuse, no no-new-privileges)" >&2
+        RUN_ARGS+=(
+            --cap-add=SETUID --cap-add=SETGID
+            --device /dev/fuse
+            --security-opt label=disable
+            -e AGENT_POD_CONTAINERS=1
+        )
+    else
+        RUN_ARGS+=( --security-opt=no-new-privileges )
+    fi
+    if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+        RUN_ARGS+=( -e ANTHROPIC_API_KEY )
+    fi
+    [[ "$OPT_LOGIN" == true ]] && add_login_args
+    [[ ${#OPT_SECRETS[@]} -eq 0 ]] || add_secret_args
+    # Only identity, not ~/.gitconfig: that file can hold credential helpers,
+    # token-bearing URLs and core.sshCommand.
+    git_name="$(git config --global user.name 2>/dev/null || true)"
+    git_email="$(git config --global user.email 2>/dev/null || true)"
+    if [[ -n "$git_name" && -n "$git_email" ]]; then
+        RUN_ARGS+=(
+            -e "GIT_AUTHOR_NAME=$git_name" -e "GIT_COMMITTER_NAME=$git_name"
+            -e "GIT_AUTHOR_EMAIL=$git_email" -e "GIT_COMMITTER_EMAIL=$git_email"
+        )
+    fi
+    if [[ "$OPT_SSH" == true ]]; then
+        [[ -S "${SSH_AUTH_SOCK:-}" ]] || die "--ssh given but SSH_AUTH_SOCK is not a socket"
+        echo "agent-pod: forwarding SSH agent; the pod can use (not read) every loaded key" >&2
+        RUN_ARGS+=( -v "$SSH_AUTH_SOCK:/run/ssh-agent.sock" -e SSH_AUTH_SOCK=/run/ssh-agent.sock )
+    fi
+}
+
+# Read-only mounts of the shared config, plus this project's memory read-write.
+# Memory is keyed by the host path, the same directory Claude Code uses on the
+# host, so memories carry over; the agent already has write access to this
+# project, so this adds no new reach. Inside the pod the project is /workspace.
+add_claude_config_args() {
+    local dir="$1" item memdir
+    for item in "${CLAUDE_SHARED[@]}"; do
+        [[ -e "$HOME/.claude/$item" ]] || continue
+        RUN_ARGS+=( -v "$HOME/.claude/$item:/home/agent/.claude/$item:ro" )
+    done
+    memdir="$HOME/.claude/projects/$(printf '%s' "$dir" | tr -c 'a-zA-Z0-9' '-')/memory"
+    mkdir -p "$memdir"
+    RUN_ARGS+=(
+        -v "$memdir:/home/agent/.claude/projects/-workspace/memory"
+        -e AGENT_POD_HOST_CONFIG=1
+    )
+}
+
+# The token reaches Podman through its environment, not its argv, so it does
+# not show up in `ps`. The agent can read it inside the pod, as it could any
+# login made there; revoke it at claude.ai if a pod may have leaked it.
+add_login_args() {
+    [[ -r "$TOKEN_FILE" ]] || die "--login: no token at $TOKEN_FILE; run 'claude setup-token' and save the token there (chmod 600)"
+    [[ "$(stat -c %a "$TOKEN_FILE")" == 600 ]] || die "--login: $TOKEN_FILE must be chmod 600"
+    CLAUDE_CODE_OAUTH_TOKEN="$(tr -d '[:space:]' < "$TOKEN_FILE")"
+    [[ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]] || die "--login: $TOKEN_FILE is empty"
+    export CLAUDE_CODE_OAUTH_TOKEN
+    RUN_ARGS+=( -e CLAUDE_CODE_OAUTH_TOKEN )
+}
+
+# Passes named host environment variables into the pod. Podman reads the value
+# from its own environment, so it never appears in argv or `ps`. Only variables
+# you name are passed, and names that would override the pod's own settings
+# are refused.
+add_secret_args() {
+    local name
+    for name in "${OPT_SECRETS[@]}"; do
+        check_secret_name "$name"
+        [[ -n "${!name:-}" ]] || die "--secret: $name is not set (or not exported) in your environment"
+        RUN_ARGS+=( -e "$name" )
+    done
+}
+
+check_secret_name() {
+    local name="$1"
+    [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "invalid secret name: $name"
+    case "$name" in
+        PATH|HOME|USER|SHELL|LD_*|AGENT_POD_*|VERIFY_*|GIT_*|SSH_AUTH_SOCK|CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY)
+            die "$name is set by agent-pod itself (for the Claude login and API key, see --login and ANTHROPIC_API_KEY)" ;;
+    esac
+}
+
+image_for_opts() {
+    if [[ "$OPT_BROWSER" == true ]]; then printf '%s:browser\n' "$IMAGE_NAME"
+    else printf '%s:latest\n' "$IMAGE_NAME"; fi
+}
+
+# Parses the run/verify flags; leaves the remaining args in POSITIONAL.
+parse_opts() {
+    OPT_SSH=false
+    OPT_CONTAINERS=false
+    OPT_BROWSER=false
+    OPT_CLEAN=false
+    OPT_LOGIN=false
+    OPT_SECRETS=()
+    POSITIONAL=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --ssh) OPT_SSH=true ;;
+            --containers) OPT_CONTAINERS=true ;;
+            --browser) OPT_BROWSER=true ;;
+            --clean) OPT_CLEAN=true ;;
+            --login) OPT_LOGIN=true ;;
+            --secret) [[ $# -ge 2 ]] || die "--secret needs a variable name"
+                      OPT_SECRETS+=( "$2" ); shift ;;
+            --secret=*) OPT_SECRETS+=( "${1#--secret=}" ) ;;
+            --) POSITIONAL+=( "$@" ); break ;;
+            -*) die "unknown option: $1" ;;
+            *) POSITIONAL+=( "$1" ) ;;
+        esac
+        shift
+    done
+}
+
+cmd_build() {
+    podman build --target base -t "$IMAGE_NAME:latest" -f "$REPO_ROOT/Containerfile" "$REPO_ROOT"
+    podman build --target browser -t "$IMAGE_NAME:browser" -f "$REPO_ROOT/Containerfile" "$REPO_ROOT"
+}
+
+# Admin mode, kept apart from work mode: the whole ~/.claude is writable here,
+# so no project is mounted and nothing untrusted is read.
+cmd_config() {
+    echo "agent-pod: ~/.claude is mounted READ-WRITE; use this only to manage plugins and skills" >&2
+    exec podman run --rm -it --name agent-pod-config --hostname agent-pod-config \
+        --userns=keep-id:uid=1000,gid=1000 --cap-drop=ALL --security-opt=no-new-privileges \
+        --read-only --network=pasta:--no-map-gw \
+        -v agent-pod-home-config:/home/agent \
+        -v "$HOME/.claude:/home/agent/.claude" \
+        --workdir /home/agent "$IMAGE_NAME:latest"
+}
+
+cmd_run() {
+    parse_opts "$@"
+    set -- "${POSITIONAL[@]}"
+    local dir slug
+    dir="$(resolve_project "${1:-}")"; shift
+    [[ "${1:-}" == "--" ]] && shift
+    slug="$(project_slug "$dir")"
+    build_run_args "$dir" "$slug" true "agent-pod-$slug"
+    exec podman "${RUN_ARGS[@]}" "$(image_for_opts)" "$@"
+}
+
+# Listeners on host 127.0.0.1 and ::1 that send a random token and close
+# (no HTTP, nothing served). The pod fails the check only if it reads the
+# token back, so a router that accepts every port is not mistaken for the host.
+# Bound and listening before the ports are printed.
+readonly LISTENER_PY='
+import os, socket, threading
+TOKEN = os.environ["VERIFY_TOKEN"].encode()
+def listen(fam, addr):
+    s = socket.socket(fam, socket.SOCK_STREAM)
+    if fam == socket.AF_INET6:
+        s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+    s.bind((addr, 0)); s.listen(16)
+    return s
+def serve(s):
+    while True:
+        c, _ = s.accept()
+        try:
+            c.sendall(TOKEN)
+        finally:
+            c.close()
+socks = [listen(socket.AF_INET, "127.0.0.1")]
+try:
+    socks.append(listen(socket.AF_INET6, "::1"))
+except OSError:
+    pass
+print(socks[0].getsockname()[1], socks[1].getsockname()[1] if len(socks) > 1 else 0, flush=True)
+threads = [threading.Thread(target=serve, args=(s,), daemon=True) for s in socks]
+[t.start() for t in threads]
+[t.join() for t in threads]
+'
+
+# Runs the in-pod checks with the exact `run` settings (except tty and name),
+# with host loopback listeners the pod must not be able to reach.
+cmd_verify() {
+    parse_opts "$@"
+    set -- "${POSITIONAL[@]}"
+    local dir slug port4 port6 token status=0
+    dir="$(resolve_project "${1:-}")"
+    slug="$(project_slug "$dir")"
+    token="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+    coproc LISTENER { VERIFY_TOKEN="$token" exec python3 -c "$LISTENER_PY"; }
+    trap 'kill "${LISTENER_PID:-}" 2>/dev/null || true' EXIT
+    read -r -t 5 port4 port6 <&"${LISTENER[0]}" || die "host test listener failed to start"
+    [[ "$port4" =~ ^[0-9]+$ ]] || die "host test listener gave no port"
+    echo "agent-pod: host listeners on 127.0.0.1:$port4 and [::1]:$port6" >&2
+    build_run_args "$dir" "$slug" false "agent-pod-verify-$slug"
+    RUN_ARGS+=( -e "VERIFY_HOST_PORT=$port4" -e "VERIFY_HOST_PORT6=$port6" -e "VERIFY_TOKEN=$token" )
+    podman "${RUN_ARGS[@]}" "$(image_for_opts)" agent-pod-verify || status=$?
+    return "$status"
+}
+
+# A second terminal in the pod that `run` started. podman exec joins the same
+# container, so the user, capabilities, mounts, limits and the environment
+# given to `run` (including --secret variables) all apply; there is no new
+# pod and no extra access. Secrets added later with `secret` are files, so
+# they are visible here too.
+cmd_shell() {
+    local dir pod
+    dir="$(resolve_project "${1:-}")"; shift
+    [[ "${1:-}" == "--" ]] && shift
+    pod="agent-pod-$(project_slug "$dir")"
+    podman container exists "$pod" || die "no running pod for $dir (start one with 'run' first)"
+    [[ $# -gt 0 ]] || set -- /bin/bash -l
+    exec podman exec -it "$pod" "$@"
+}
+
+cmd_stop() {
+    local dir; dir="$(resolve_project "${1:-}")"
+    podman stop "agent-pod-$(project_slug "$dir")"
+}
+
+# Hands a secret to a pod that is already running. A running process's
+# environment cannot be changed, so the value goes into a file on the pod's
+# tmpfs /tmp (directory mode 700, file mode 600), which disappears when the pod
+# stops. The value travels over stdin, never argv. The agent reads it with
+# `export NAME=$(cat /tmp/.agent-secrets/NAME)`.
+cmd_secret() {
+    local dir name value pod
+    dir="$(resolve_project "${1:-}")"
+    name="${2:-}"
+    [[ -n "$name" ]] || die "usage: agent-pod secret <project-dir> NAME"
+    check_secret_name "$name"
+    pod="agent-pod-$(project_slug "$dir")"
+    podman container exists "$pod" || die "no running pod for $dir (start one with 'run' first)"
+    if [[ -n "${!name:-}" ]]; then
+        value="${!name}"
+    elif [[ -t 0 ]]; then
+        read -r -s -p "Value for $name: " value; echo >&2
+    else
+        IFS= read -r value || true
+    fi
+    [[ -n "$value" ]] || die "empty value for $name"
+    printf '%s' "$value" | podman exec -i "$pod" sh -c \
+        'umask 077 && mkdir -p /tmp/.agent-secrets && cat > "/tmp/.agent-secrets/$1"' _ "$name"
+    echo "agent-pod: $name is at /tmp/.agent-secrets/$name in the pod (removed when it stops)" >&2
+}
+
+cmd_reset() {
+    local dir slug; dir="$(resolve_project "${1:-}")"; slug="$(project_slug "$dir")"
+    podman volume rm "agent-pod-home-$slug"
+}
+
+cmd_destroy() {
+    podman ps -aq --filter label=agent-pod=1 | xargs -r podman rm -f
+    { podman volume ls -q | grep '^agent-pod-home-' || true; } | xargs -r podman volume rm
+    podman image rm -f "$IMAGE_NAME:latest" "$IMAGE_NAME:browser" 2>/dev/null || true
+}
+
+main() {
+    command -v podman >/dev/null || die "podman not found"
+    local cmd="${1:-}"; shift || true
+    case "$cmd" in
+        build)   cmd_build ;;
+        config)  cmd_config ;;
+        run)     cmd_run "$@" ;;
+        verify)  cmd_verify "$@" ;;
+        shell)   cmd_shell "$@" ;;
+        stop)    cmd_stop "$@" ;;
+        secret)  cmd_secret "$@" ;;
+        reset)   cmd_reset "$@" ;;
+        destroy) cmd_destroy ;;
+        -h|--help|help|"") usage ;;
+        *) usage; exit 2 ;;
+    esac
+}
+
+main "$@"

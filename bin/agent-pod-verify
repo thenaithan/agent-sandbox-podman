@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# Runs inside an agent pod and checks each isolation property the launcher
+# claims. Exit status is the number of failed checks (0 = all passed).
+# WARN lines are known limitations, not failures. Checks are written to fail
+# when unsure: a false FAIL costs a look, a false PASS costs the guarantee.
+set -uo pipefail
+
+fails=0
+pass() { printf 'PASS  %s\n' "$1"; }
+fail() { printf 'FAIL  %s\n' "$1"; fails=$((fails + 1)); }
+warn() { printf 'WARN  %s\n' "$1"; }
+
+containers_mode() { [[ "${AGENT_POD_CONTAINERS:-0}" == 1 ]]; }
+
+# TCP connect with a short timeout, using bash's /dev/tcp.
+can_connect() { timeout 3 bash -c 'exec 3<>"/dev/tcp/$0/$1"' "$1" "$2" 2>/dev/null; }
+
+# Connects and prints whatever the far end sends first (the host listener sends VERIFY_TOKEN).
+read_banner() { timeout 3 bash -c 'exec 3<>"/dev/tcp/$0/$1" && head -c 64 <&3' "$1" "$2" 2>/dev/null; }
+
+status_field() { awk -v k="$1:" '$1 == k {print $2}' /proc/self/status; }
+
+check_identity() {
+    if [[ "$(id -u)" != 0 ]]; then pass "not running as root (uid $(id -u))"
+    else fail "running as root inside the pod"; fi
+}
+
+# A non-root process has CapEff=0 even without --cap-drop, so check the
+# bounding and ambient sets, which --cap-drop=ALL actually controls.
+check_capabilities() {
+    local bnd amb expected=0
+    bnd="$(status_field CapBnd)"
+    amb="$(status_field CapAmb)"
+    containers_mode && expected=$((expected | 0xc0))   # CAP_SETGID (6) + CAP_SETUID (7)
+    [[ "${AGENT_POD_BROWSER:-0}" == 1 ]] && expected=$((expected | 0x40000))   # CAP_SYS_CHROOT (18)
+    if (( 16#$bnd == expected )); then pass "capability bounding set as expected (CapBnd=$bnd)"
+    else fail "capability bounding set too wide: CapBnd=$bnd (expected $(printf '%016x' "$expected"))"; fi
+    # Podman also raises added capabilities into the ambient set for a non-root user.
+    if (( 16#$amb == expected || 16#$amb == 0 )); then pass "ambient capabilities as expected (CapAmb=$amb)"
+    else fail "unexpected ambient capabilities: CapAmb=$amb"; fi
+    if containers_mode; then
+        warn "--containers: no_new_privs is off so nested Podman can use newuidmap"
+    elif [[ "$(status_field NoNewPrivs)" == 1 ]]; then pass "no_new_privs is set"
+    else fail "no_new_privs is not set"; fi
+}
+
+# Every mount must be one of: the read-only image root, an exact allowlisted
+# path, read-only shared Claude config, or a pseudo/tmpfs filesystem that
+# Podman itself creates. A host directory bound anywhere else (even under /tmp
+# or /run), or shared config mounted writable, fails.
+check_mounts() {
+    local bad
+    bad="$(awk -v ssh="${SSH_AUTH_SOCK:-}" -v memory="$MEMORY_DIR" '
+        BEGIN {
+            split("/workspace /home/agent /etc/hosts /etc/hostname /etc/resolv.conf /etc/passwd /etc/group /run/.containerenv", a, " ")
+            for (i in a) allowed[a[i]] = 1
+            if (ssh != "") allowed[ssh] = 1
+            split("/tmp /var/tmp /run /run/lock /dev /dev/shm", t, " ")
+            for (i in t) tmpfs_ok[t[i]] = 1
+        }
+        {
+            root = $4; mp = $5
+            for (i = 7; i <= NF; i++) if ($i == "-") { fstype = $(i + 1); break }
+            if (mp == "/" || mp in allowed) next
+            if (mp == memory) next
+            if (mp ~ /^\/home\/agent\/\.claude\//) {
+                if (("," $6 ",") ~ /,ro,/) next
+                printf "%s (shared config mounted WRITABLE); ", mp; next
+            }
+            if (fstype == "tmpfs" && root == "/" && mp in tmpfs_ok) next
+            # The pod'"'"'s own procfs/sysfs (incl. read-only sub-binds) and masks.
+            if (mp ~ /^\/proc(\/|$)/ && fstype == "proc") next
+            if (mp ~ /^\/sys(\/|$)/ && fstype == "sysfs") next
+            if (mp == "/sys/fs/cgroup" && fstype == "cgroup2" && root == "/") next
+            if (mp ~ /^\/(proc|sys)\// && ((fstype == "tmpfs" && root == "/") || (fstype == "devtmpfs" && root == "/null"))) next
+            if (mp ~ /^\/dev\// && fstype ~ /^(devpts|mqueue|tmpfs)$/ && (root == "/" || root ~ /^\/([0-9]+|ptmx)$/)) next
+            if (mp ~ /^\/dev\// && fstype == "devtmpfs" && root ~ /^\/(null|zero|full|random|urandom|tty|fuse)$/) next
+            printf "%s (%s, source root %s); ", mp, fstype, root
+        }' /proc/self/mountinfo)"
+    if [[ -z "$bad" ]]; then pass "only allowlisted mounts present"
+    else fail "unexpected mounts: $bad"; fi
+}
+
+readonly MEMORY_DIR=/home/agent/.claude/projects/-workspace/memory
+
+check_host_config() {
+    local n
+    if [[ "${AGENT_POD_HOST_CONFIG:-0}" != 1 ]]; then pass "no host Claude config mounted (--clean)"; return; fi
+    n="$(awk '$5 ~ /^\/home\/agent\/\.claude\// && $5 != m' m="$MEMORY_DIR" /proc/self/mountinfo | wc -l)"
+    pass "host Claude config: $n read-only mounts (rules, skills, agents, plugins, ...)"
+    if [[ -O /home/agent/.claude && -w /home/agent/.claude/projects/-workspace ]]; then
+        pass "agent owns ~/.claude (sessions and login can be written)"
+    else fail "~/.claude or projects/-workspace not writable by the agent; run 'agent-pod reset <dir>'"; fi
+    if touch "$MEMORY_DIR/.agent-pod-write-test" 2>/dev/null; then
+        rm -f "$MEMORY_DIR/.agent-pod-write-test"; pass "project memory is writable (shared with host)"
+    else fail "project memory is not writable: $MEMORY_DIR"; fi
+}
+
+# Chrome should start headless with its own sandbox (user namespaces), not
+# with --no-sandbox. If it can't, the container is Chrome's only boundary.
+# On failure, narrow down why: can the pod create a user namespace at all,
+# and does Chrome work with its sandbox turned off?
+chrome_render() {
+    timeout 60 google-chrome --headless=new --disable-gpu --no-first-run "$@" \
+        --user-data-dir="$(mktemp -d)" --dump-dom 'data:text/html,<p>agent-pod-ok</p>' 2>&1
+}
+
+check_browser() {
+    [[ "${AGENT_POD_BROWSER:-0}" == 1 ]] || return 0
+    local out userns
+    if out="$(unshare --user --map-root-user true 2>&1)"; then userns="user namespaces allowed"
+    else userns="user namespaces blocked: ${out:-unshare failed}"; fi
+    out="$(chrome_render)"
+    if grep -q 'agent-pod-ok' <<<"$out"; then
+        pass "Chrome runs headless with its sandbox enabled ($userns)"
+    elif chrome_render --no-sandbox | grep -q 'agent-pod-ok'; then
+        fail "Chrome renders only with --no-sandbox; its sandbox fails ($userns)"
+    else
+        fail "Chrome fails even with --no-sandbox ($userns): $(grep -m1 -E 'FATAL|ERROR' <<<"$out" | cut -c1-200)"
+    fi
+}
+
+check_readonly_root() {
+    local opts
+    opts="$(awk '$5 == "/" {print $6}' /proc/self/mountinfo | tail -1)"
+    if [[ ",$opts," == *,ro,* ]]; then pass "root filesystem mounted read-only"
+    else fail "root filesystem not mounted read-only (options: $opts)"; fi
+}
+
+# GNU find -type s trusts the directory entry type, and a bind-mounted socket
+# keeps the type of its mount point (an empty regular file). So list empty
+# files too and test each one with stat (bash -S) before trusting it.
+check_runtime_sockets() {
+    local found="" f
+    while IFS= read -r -d '' f; do
+        [[ -S "$f" && "$f" != /run/ssh-agent.sock ]] && found+=" $f"
+    done < <(command find / \( -path /proc -o -path /sys -o -path /workspace -o -path /home/agent \) -prune \
+                 -o \( -type s -o \( -type f -size 0 \) \) -print0 2>/dev/null)
+    if [[ -z "$found" ]]; then pass "no unexpected unix sockets (container runtime, display, etc.)"
+    else fail "unexpected unix sockets:$found"; fi
+}
+
+check_display() {
+    if [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] || compgen -G '/tmp/.X11-unix/*' >/dev/null; then
+        fail "display server socket or variable present"
+    else pass "no X11/Wayland access"; fi
+}
+
+check_limits() {
+    local f v
+    for f in pids.max memory.max cpu.max; do
+        v="$(cut -d' ' -f1 "/sys/fs/cgroup/$f" 2>/dev/null || echo unknown)"
+        if [[ "$v" != max && "$v" != unknown ]]; then pass "limit $f: $v"
+        else fail "no limit $f ($v)"; fi
+    done
+}
+
+# The launcher starts listeners on host 127.0.0.1 and ::1 that send a random
+# token. Try every address that could lead back to the host; only reading the
+# token back counts as reaching it. Other answers are reported, not failed.
+probe() {
+    local target="$1" port="$2" label="$3" got
+    tried+=" $label"
+    got="$(read_banner "$target" "$port")"
+    if [[ "$got" == "$VERIFY_TOKEN" ]]; then reached+=" $label"
+    elif can_connect "$target" "$port"; then other+=" $label"; fi
+}
+
+check_host_loopback() {
+    local p4="${VERIFY_HOST_PORT:-}" p6="${VERIFY_HOST_PORT6:-0}" gw4 gw6 hci t
+    local reached="" tried="" other=""
+    if [[ -z "$p4" || -z "${VERIFY_TOKEN:-}" ]]; then fail "VERIFY_HOST_PORT/VERIFY_TOKEN unset; run via 'agent-pod verify'"; return; fi
+    gw4="$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}')"
+    gw6="$(ip -6 route show default 2>/dev/null | awk '{print $3; exit}')"
+    hci="$(getent ahostsv4 host.containers.internal 2>/dev/null | awk '{print $1; exit}')"
+    [[ -z "$gw4" ]] && warn "no IPv4 default route found"
+    for t in $(printf '%s\n' $gw4 $hci 169.254.1.2 | awk '!seen[$0]++'); do probe "$t" "$p4" "$t:$p4"; done
+    if [[ "$p6" != 0 ]]; then
+        for t in $gw6 fe80::1; do probe "$t" "$p6" "[$t]:$p6"; done
+    else warn "host has no ::1 listener; IPv6 loopback not tested"; fi
+    if [[ -n "$other" ]]; then
+        warn "something other than the host listener answered at:$other (e.g. a router accepting every port)"
+    fi
+    if [[ -z "$reached" ]]; then pass "host loopback listeners unreachable (tried$tried)"
+    else fail "host loopback reachable (token read back) via:$reached"; fi
+}
+
+check_agent() {
+    local out
+    if out="$(claude --version 2>&1)"; then pass "claude runs ($(head -1 <<<"$out"))"
+    else fail "claude does not run: $(command -v claude || echo 'not on PATH'): $(head -2 <<<"$out" | tr '\n' ' ')"; fi
+    if can_connect api.anthropic.com 443; then pass "can reach api.anthropic.com:443"
+    else fail "cannot reach api.anthropic.com:443 (agent will not work)"; fi
+    if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+        warn "--login: your Claude login token is in this pod's environment"
+    fi
+    warn "egress is not filtered: the pod can reach the internet, your LAN and the host's LAN address"
+}
+
+main() {
+    check_identity
+    check_capabilities
+    check_mounts
+    check_host_config
+    check_readonly_root
+    check_runtime_sockets
+    check_display
+    check_limits
+    check_host_loopback
+    check_agent
+    check_browser
+    echo
+    if (( fails == 0 )); then echo "All checks passed."; else echo "$fails check(s) failed."; fi
+    exit "$fails"
+}
+
+main "$@"
