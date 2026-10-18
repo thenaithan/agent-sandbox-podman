@@ -138,6 +138,28 @@ check_godot() {
     fi
 }
 
+# The agent needs to see what a scene looks like. Render a one-colour scene on
+# the pod's own virtual display (Xvfb + software GL) and write it out with
+# Godot's movie writer. The display exists only for this command, inside the
+# pod; the host display is never involved.
+check_godot_render() {
+    [[ "${AGENT_POD_GODOT:-0}" == 1 ]] || return 0
+    local dir out png
+    dir="$(mktemp -d)"
+    printf 'config_version=5\n[application]\nconfig/name="agent-pod-render"\nrun/main_scene="res://main.tscn"\n' > "$dir/project.godot"
+    printf '[gd_scene format=3]\n\n[node name="Main" type="ColorRect"]\noffset_right = 64.0\noffset_bottom = 64.0\ncolor = Color(1, 0, 0, 1)\n' > "$dir/main.tscn"
+    out="$(timeout 120 xvfb-run -a -s '-screen 0 320x240x24' godot --path "$dir" \
+        --rendering-method gl_compatibility --rendering-driver opengl3 \
+        --write-movie "$dir/shot.png" --fixed-fps 10 --quit-after 3 2>&1)"
+    png="$(compgen -G "$dir/shot*.png" | head -1)"
+    if [[ -n "$png" && "$(head -c 4 "$png" | tail -c 3)" == PNG ]]; then
+        pass "Godot renders a scene on the pod's virtual display (screenshots work)"
+    else
+        fail "Godot could not render on the virtual display: $({ grep -m1 -E 'ERROR|Xvfb|GLX' <<<"$out" || head -1 <<<"$out"; } | cut -c1-200)"
+    fi
+    rm -rf "$dir"
+}
+
 check_readonly_root() {
     local opts
     opts="$(awk '$5 == "/" {print $6}' /proc/self/mountinfo | tail -1)"
@@ -228,6 +250,7 @@ main() {
     check_agent
     check_browser
     check_godot
+    check_godot_render
     echo
     if (( fails == 0 )); then echo "All checks passed."; else echo "$fails check(s) failed."; fi
     exit "$fails"

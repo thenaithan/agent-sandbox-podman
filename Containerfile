@@ -86,11 +86,17 @@ RUN printf '%s\n' '[google-chrome]' 'name=google-chrome' \
 USER agent
 
 # --- godot: base + the Godot engine from Fedora's signed repo, for `run --godot`.
-# Headless only (`godot --headless`): no display, no GPU. Enough to run scripts,
-# GUT/gdUnit4 tests, imports and project checks. No export templates.
+# `godot --headless` runs scripts, GUT/gdUnit4 tests and imports with no display.
+# To let the agent SEE a scene, the image also has a virtual display (Xvfb) and
+# Mesa software rendering (llvmpipe for OpenGL, lavapipe for Vulkan): no GPU and
+# no host display. The agent starts it per command with `xvfb-run`; nothing runs
+# at boot. No export templates.
 FROM base AS godot
 USER root
-RUN dnf install -y --setopt=install_weak_deps=False godot && \
+RUN dnf install -y --setopt=install_weak_deps=False \
+        godot xorg-x11-server-Xvfb xorg-x11-xauth \
+        mesa-dri-drivers mesa-vulkan-drivers && \
     dnf clean all && \
     godot --headless --version
+ENV LIBGL_ALWAYS_SOFTWARE=1
 USER agent
