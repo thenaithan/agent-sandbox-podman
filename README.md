@@ -2,7 +2,7 @@
 
 `agent-pod` runs an autonomous coding agent (Claude Code) in a rootless Podman container. From the host, the container gets one project directory and its own per-project state volume, and nothing else. It ships with a check script that tests those limits on your machine, instead of asking you to take them on trust.
 
-> **Status:** early. `verify` passes with the default profile, with `--containers` and with `--browser` (Chrome renders with its own sandbox enabled), on one Linux machine with rootless Podman 5 and pasta. `--containers` and `--browser` together are untested. Run [Verify](#verify) on yours.
+> **Status:** early. `verify` passes with the default profile, with `--containers`, with `--browser` (Chrome renders with its own sandbox enabled) and with `--godot` (Godot 4.7.2 runs headless and renders a scene on the pod's virtual display), on one Linux machine with rootless Podman 5 and pasta. `--containers` combined with `--browser` or `--godot` is untested, and `--browser` and `--godot` cannot be combined. Run [Verify](#verify) on yours.
 
 ## Why
 
@@ -138,7 +138,7 @@ The host needs a subuid range of at least 65,536. `verify --containers` reports 
 
 ## Verify
 
-`agent-pod verify [--containers] <dir>` builds its pod arguments with the same function `run` uses. The only differences are no TTY, a different container name and two extra environment variables. Before starting the pod, it opens accept-and-close listeners (no HTTP, nothing served) on host `127.0.0.1` and `::1`. It then runs [`agent-pod-verify`](bin/agent-pod-verify) inside the pod. The checks are written to fail when in doubt, and the exit code is the number of failures.
+`agent-pod verify [--containers] [--browser|--godot] <dir>` builds its pod arguments with the same function `run` uses. The only differences are no TTY, a different container name and two extra environment variables. Before starting the pod, it opens accept-and-close listeners (no HTTP, nothing served) on host `127.0.0.1` and `::1`. It then runs [`agent-pod-verify`](bin/agent-pod-verify) inside the pod. The checks are written to fail when in doubt, and the exit code is the number of failures.
 
 Output on the author's machine (default mode; gateway addresses replaced):
 
@@ -162,6 +162,8 @@ WARN  egress is not filtered: the pod can reach the internet, your LAN and the h
 
 All checks passed.
 ```
+
+With `--godot`, the same checks pass plus two more at the end: `PASS  Godot runs headless (4.7.2.stable.fedora.…)` and `PASS  Godot renders a scene on the pod's virtual display (screenshots work)`. The pod's capability sets and `no_new_privs` are unchanged from the default profile.
 
 With `--containers`, the same checks pass, and the capability lines read `CapBnd`/`CapAmb=00000000000000c0` with a WARN that `no_new_privs` is off.
 
