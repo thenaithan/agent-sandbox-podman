@@ -75,7 +75,8 @@ Note: GNU `find -type s` misses bind-mounted sockets, because the directory entr
  │   │ own netns (pasta) ──────► internet / LAN   ✗ host lo    │
  │   └─────────────────────────────────────────────────────────┘
  │
- ✗ not mounted: podman socket, X11/Wayland, ~/.claude, ~/.ssh, other projects
+ ✗ not mounted: podman socket, X11/Wayland, ~/.ssh, other projects, ~/.claude
+   (except rules/skills/plugins read-only, and this project's memory)
 ```
 
 ## Usage
@@ -115,14 +116,14 @@ To install or update plugins and skills, run `./bin/agent-pod config`. It's a se
         --rendering-method gl_compatibility --rendering-driver opengl3 \
         --write-movie /tmp/shots/frame.png --fixed-fps 10 --quit-after 30
     ```
-    Software rendering is slow, and the `gl_compatibility` renderer is the reliable choice. Vulkan (lavapipe) is installed too, for projects that need Forward+. Pass `--scene res://x.tscn` to render a specific scene. There are no export templates, and the image can't be combined with `--browser`. Godot writes its import cache to `.godot/` inside the project, so add that directory to the project's `.gitignore`.
+    Software rendering is slow, and the `gl_compatibility` renderer is the reliable choice. Vulkan (lavapipe) is installed too, for projects that need Forward+, but `verify` does not exercise it; only the `gl_compatibility` path is tested. Pass `--scene res://x.tscn` to render a specific scene. There are no export templates, and the image can't be combined with `--browser`. Godot writes its import cache to `.godot/` inside the project, so add that directory to the project's `.gitignore`.
 - `--login` passes a Claude login token instead of a separate login per project. Create it once with `claude setup-token` and save it, readable only by you:
   ```bash
   mkdir -p ~/.config/agent-pod && (umask 077; cat > ~/.config/agent-pod/claude-token)   # paste, then Ctrl-D
   ```
   The pod gets the token in its environment, so the agent can read it, but a login made inside the pod gives it the same access anyway. The difference is reach: one token now serves every project you start with `--login`, so a leak from one pod affects all of them. Revoke it at claude.ai if needed. Your host's own login (`~/.claude/.credentials.json`) is still never mounted.
 - `--secret NAME` passes the host environment variable `NAME` into the pod, for a project that needs one credential (a staging API key, say). Repeat it for several: `--secret STAGING_API_KEY --secret SENTRY_TOKEN`. The variable must be set and exported on the host. Podman reads the value from its environment, so it stays out of `ps`. The agent can read what you pass, so use a key scoped to this one project. Names the pod sets itself (`PATH`, `HOME`, `GIT_*`, `ANTHROPIC_API_KEY` and so on) are refused.
-- **Several pods per project.** A plain pod and a `--godot` or `--browser` pod for the same project can run at the same time, each as its own container (`agent-pod-<project>`, `agent-pod-<project>-godot`, `-browser`). They share the project mount, the home volume (login, history) and the project memory. Pass the same `--godot`/`--browser` flag to `shell`, `stop` and `secret` to pick which pod you mean. Two agents writing to one project at once can still overwrite each other's edits.
+- **Several pods per project.** A plain pod and a `--godot` or `--browser` pod for the same project can run at the same time, each as its own container (`agent-pod-<project>`, `agent-pod-<project>-godot`, `-browser`). They share the project mount, the home volume (login, history) and the project memory. Pass the same `--godot`/`--browser` flag to `shell`, `stop` and `secret` to pick which pod you mean. Two agents writing to one project at once can still overwrite each other's edits, and because they share one home volume, both Claude Code instances write the same `~/.claude.json`; a race there can lose settings or history.
 - `agent-pod shell <dir>` opens another bash terminal in the pod that `run` started, for example to watch the agent's work or run a command while it works. It joins the same container, so the user, mounts, limits and environment are identical, and it grants no extra access. Add `-- cmd` to run one command instead of a shell. It needs a running pod, so `run` first.
 - `agent-pod secret <dir> NAME` hands a secret to a pod that is already running, for when you need one halfway through a session. The value comes from the host variable `NAME` if it's exported, otherwise from stdin or a silent prompt. It lands as a file at `/tmp/.agent-secrets/NAME` (mode 600, directory 700) on the pod's tmpfs, so it disappears when the pod stops. A running process can't gain environment variables, so tell the agent to read it: `export NAME=$(cat /tmp/.agent-secrets/NAME)`. The same trade-off as `--secret` applies: the agent can read it.
 - `--clean` mounts none of your `~/.claude` config or memory. Use it for a project you trust less than usual.
