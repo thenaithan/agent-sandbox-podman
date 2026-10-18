@@ -27,10 +27,12 @@ Commands:
   build                 Build all images (base, browser and godot) from the Containerfile
   run [opts] <dir>      Start an interactive pod with <dir> mounted at /workspace
   verify [opts] <dir>   Start a pod with the same settings as `run` and test its isolation
-  shell <dir> [-- cmd]  Open another shell (or run cmd) in the RUNNING pod for <dir>,
+  shell [opts] <dir> [-- cmd]
+                        Open another shell (or run cmd) in the RUNNING pod for <dir>,
                         with the same settings, mounts and environment as `run`
-  stop <dir>            Stop the running pod for <dir>
-  secret <dir> NAME     Hand a secret to the RUNNING pod for <dir>, as a file at
+  stop [opts] <dir>     Stop the running pod for <dir>
+  secret [opts] <dir> NAME
+                        Hand a secret to the RUNNING pod for <dir>, as a file at
                         /tmp/.agent-secrets/NAME (gone when the pod stops). The value
                         comes from host variable NAME if exported, else from stdin or a
                         silent prompt
@@ -39,7 +41,8 @@ Commands:
                         project, for installing or updating plugins and skills
   destroy               Remove all agent-pod containers, volumes and images
 
-Options for run and verify:
+Options for run and verify (shell, stop and secret take --browser/--godot to pick
+the pod; a plain pod and a --godot or --browser pod can run side by side):
   --ssh                 Forward the host SSH agent into the pod
   --containers          Allow nested rootless Podman inside the pod (weaker profile, see README)
   --browser             Use the image with Google Chrome (headless) and a larger /dev/shm
@@ -210,6 +213,16 @@ check_secret_name() {
     esac
 }
 
+# One pod per project and image variant, so a plain pod and a --godot (or
+# --browser) pod for the same project can run side by side. They share the
+# project mount and the home volume. Reads the OPT_* flags.
+pod_name() {
+    local suffix=""
+    [[ "$OPT_BROWSER" == true ]] && suffix=-browser
+    [[ "$OPT_GODOT" == true ]] && suffix=-godot
+    printf 'agent-pod-%s%s\n' "$1" "$suffix"
+}
+
 image_for_opts() {
     if [[ "$OPT_BROWSER" == true ]]; then printf '%s:browser\n' "$IMAGE_NAME"
     elif [[ "$OPT_GODOT" == true ]]; then printf '%s:godot\n' "$IMAGE_NAME"
@@ -271,7 +284,7 @@ cmd_run() {
     dir="$(resolve_project "${1:-}")"; shift
     [[ "${1:-}" == "--" ]] && shift
     slug="$(project_slug "$dir")"
-    build_run_args "$dir" "$slug" true "agent-pod-$slug"
+    build_run_args "$dir" "$slug" true "$(pod_name "$slug")"
     exec podman "${RUN_ARGS[@]}" "$(image_for_opts)" "$@"
 }
 
@@ -332,18 +345,22 @@ cmd_verify() {
 # pod and no extra access. Secrets added later with `secret` are files, so
 # they are visible here too.
 cmd_shell() {
+    parse_opts "$@"
+    set -- "${POSITIONAL[@]}"
     local dir pod
     dir="$(resolve_project "${1:-}")"; shift
     [[ "${1:-}" == "--" ]] && shift
-    pod="agent-pod-$(project_slug "$dir")"
+    pod="$(pod_name "$(project_slug "$dir")")"
     podman container exists "$pod" || die "no running pod for $dir (start one with 'run' first)"
     [[ $# -gt 0 ]] || set -- /bin/bash -l
     exec podman exec -it "$pod" "$@"
 }
 
 cmd_stop() {
+    parse_opts "$@"
+    set -- "${POSITIONAL[@]}"
     local dir; dir="$(resolve_project "${1:-}")"
-    podman stop "agent-pod-$(project_slug "$dir")"
+    podman stop "$(pod_name "$(project_slug "$dir")")"
 }
 
 # Hands a secret to a pod that is already running. A running process's
@@ -352,12 +369,14 @@ cmd_stop() {
 # stops. The value travels over stdin, never argv. The agent reads it with
 # `export NAME=$(cat /tmp/.agent-secrets/NAME)`.
 cmd_secret() {
+    parse_opts "$@"
+    set -- "${POSITIONAL[@]}"
     local dir name value pod
     dir="$(resolve_project "${1:-}")"
     name="${2:-}"
     [[ -n "$name" ]] || die "usage: agent-pod secret <project-dir> NAME"
     check_secret_name "$name"
-    pod="agent-pod-$(project_slug "$dir")"
+    pod="$(pod_name "$(project_slug "$dir")")"
     podman container exists "$pod" || die "no running pod for $dir (start one with 'run' first)"
     if [[ -n "${!name:-}" ]]; then
         value="${!name}"
