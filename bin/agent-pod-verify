@@ -120,6 +120,24 @@ check_browser() {
     fi
 }
 
+# Godot should start headless and run a GDScript from a throwaway project,
+# the same way a test runner would. HOME is writable (the home volume), which
+# is where Godot keeps its user data.
+check_godot() {
+    [[ "${AGENT_POD_GODOT:-0}" == 1 ]] || return 0
+    local dir out
+    dir="$(mktemp -d)"
+    printf 'config_version=5\n[application]\nconfig/name="agent-pod-verify"\n' > "$dir/project.godot"
+    printf 'extends SceneTree\nfunc _init():\n\tprint("agent-pod-ok")\n\tquit()\n' > "$dir/check.gd"
+    out="$(timeout 60 godot --headless --path "$dir" --script check.gd 2>&1)"
+    rm -rf "$dir"
+    if grep -q 'agent-pod-ok' <<<"$out"; then
+        pass "Godot runs headless ($(godot --headless --version 2>/dev/null | head -1))"
+    else
+        fail "Godot headless script did not run: $(grep -m1 -E 'ERROR|SCRIPT ERROR' <<<"$out" | cut -c1-200)"
+    fi
+}
+
 check_readonly_root() {
     local opts
     opts="$(awk '$5 == "/" {print $6}' /proc/self/mountinfo | tail -1)"
@@ -209,6 +227,7 @@ main() {
     check_host_loopback
     check_agent
     check_browser
+    check_godot
     echo
     if (( fails == 0 )); then echo "All checks passed."; else echo "$fails check(s) failed."; fi
     exit "$fails"

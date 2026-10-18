@@ -24,7 +24,7 @@ usage() {
 Usage: agent-pod <command> [options] <project-dir> [-- command...]
 
 Commands:
-  build                 Build both images (base and browser) from the Containerfile
+  build                 Build all images (base, browser and godot) from the Containerfile
   run [opts] <dir>      Start an interactive pod with <dir> mounted at /workspace
   verify [opts] <dir>   Start a pod with the same settings as `run` and test its isolation
   shell <dir> [-- cmd]  Open another shell (or run cmd) in the RUNNING pod for <dir>,
@@ -43,6 +43,8 @@ Options for run and verify:
   --ssh                 Forward the host SSH agent into the pod
   --containers          Allow nested rootless Podman inside the pod (weaker profile, see README)
   --browser             Use the image with Google Chrome (headless) and a larger /dev/shm
+  --godot               Use the image with the Godot engine, for `godot --headless` runs and
+                        tests (not combinable with --browser)
   --clean               Do not mount your ~/.claude config or this project's memory
   --login               Pass your Claude login token (from `claude setup-token`) instead
                         of logging in per project; read from AGENT_POD_TOKEN_FILE
@@ -116,6 +118,9 @@ build_run_args() {
         # classic chroot + setuid-binary escalation.
         RUN_ARGS+=( --shm-size=1g --cap-add=SYS_CHROOT -e AGENT_POD_BROWSER=1 )
     fi
+    # Godot needs no extra privileges: headless mode uses dummy display and audio
+    # drivers, so the profile stays as strict as the default.
+    [[ "$OPT_GODOT" == true ]] && RUN_ARGS+=( -e AGENT_POD_GODOT=1 )
     if [[ "$OPT_CONTAINERS" == true ]]; then
         # Nested rootless Podman needs newuidmap/newgidmap (file capabilities,
         # so no no-new-privileges), SETUID/SETGID inside the user namespace,
@@ -207,6 +212,7 @@ check_secret_name() {
 
 image_for_opts() {
     if [[ "$OPT_BROWSER" == true ]]; then printf '%s:browser\n' "$IMAGE_NAME"
+    elif [[ "$OPT_GODOT" == true ]]; then printf '%s:godot\n' "$IMAGE_NAME"
     else printf '%s:latest\n' "$IMAGE_NAME"; fi
 }
 
@@ -215,6 +221,7 @@ parse_opts() {
     OPT_SSH=false
     OPT_CONTAINERS=false
     OPT_BROWSER=false
+    OPT_GODOT=false
     OPT_CLEAN=false
     OPT_LOGIN=false
     OPT_SECRETS=()
@@ -224,6 +231,7 @@ parse_opts() {
             --ssh) OPT_SSH=true ;;
             --containers) OPT_CONTAINERS=true ;;
             --browser) OPT_BROWSER=true ;;
+            --godot) OPT_GODOT=true ;;
             --clean) OPT_CLEAN=true ;;
             --login) OPT_LOGIN=true ;;
             --secret) [[ $# -ge 2 ]] || die "--secret needs a variable name"
@@ -235,11 +243,13 @@ parse_opts() {
         esac
         shift
     done
+    [[ "$OPT_BROWSER" == false || "$OPT_GODOT" == false ]] || die "--browser and --godot use separate images and cannot be combined"
 }
 
 cmd_build() {
     podman build --target base -t "$IMAGE_NAME:latest" -f "$REPO_ROOT/Containerfile" "$REPO_ROOT"
     podman build --target browser -t "$IMAGE_NAME:browser" -f "$REPO_ROOT/Containerfile" "$REPO_ROOT"
+    podman build --target godot -t "$IMAGE_NAME:godot" -f "$REPO_ROOT/Containerfile" "$REPO_ROOT"
 }
 
 # Admin mode, kept apart from work mode: the whole ~/.claude is writable here,
@@ -370,7 +380,7 @@ cmd_reset() {
 cmd_destroy() {
     podman ps -aq --filter label=agent-pod=1 | xargs -r podman rm -f
     { podman volume ls -q | grep '^agent-pod-home-' || true; } | xargs -r podman volume rm
-    podman image rm -f "$IMAGE_NAME:latest" "$IMAGE_NAME:browser" 2>/dev/null || true
+    podman image rm -f "$IMAGE_NAME:latest" "$IMAGE_NAME:browser" "$IMAGE_NAME:godot" 2>/dev/null || true
 }
 
 main() {

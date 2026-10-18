@@ -84,3 +84,13 @@ RUN printf '%s\n' '[google-chrome]' 'name=google-chrome' \
     chmod 0755 /opt/google/chrome/chrome-sandbox && \
     google-chrome --version
 USER agent
+
+# --- godot: base + the Godot engine from Fedora's signed repo, for `run --godot`.
+# Headless only (`godot --headless`): no display, no GPU. Enough to run scripts,
+# GUT/gdUnit4 tests, imports and project checks. No export templates.
+FROM base AS godot
+USER root
+RUN dnf install -y --setopt=install_weak_deps=False godot && \
+    dnf clean all && \
+    godot --headless --version
+USER agent
