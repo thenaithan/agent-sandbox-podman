@@ -134,7 +134,7 @@ check_godot() {
     if grep -q 'agent-pod-ok' <<<"$out"; then
         pass "Godot runs headless ($(godot --headless --version 2>/dev/null | head -1))"
     else
-        fail "Godot headless script did not run: $(grep -m1 -E 'ERROR|SCRIPT ERROR' <<<"$out" | cut -c1-200)"
+        fail "Godot headless script did not run: $({ grep -m1 ERROR <<<"$out" || head -1 <<<"$out"; } | cut -c1-200)"
     fi
 }
 
