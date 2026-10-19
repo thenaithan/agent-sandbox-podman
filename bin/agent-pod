@@ -26,17 +26,21 @@ Usage: agent-pod <command> [options] <project-dir> [-- command...]
 Commands:
   build                 Build all images (base, browser and godot) from the Containerfile
   run [opts] <dir>      Start an interactive pod with <dir> mounted at /workspace
+                        (--detach starts it in the background; use shell and stop)
   verify [opts] <dir>   Start a pod with the same settings as `run` and test its isolation
   shell [opts] <dir> [-- cmd]
                         Open another shell (or run cmd) in the RUNNING pod for <dir>,
-                        with the same settings, mounts and environment as `run`
+                        with the same settings, mounts and environment as `run`.
+                        Without a terminal (a script, a pipe) stdin/stdout are passed
+                        through, so `echo prompt | agent-pod shell <dir> -- cmd` works
   stop [opts] <dir>     Stop the running pod for <dir>
   secret [opts] <dir> NAME
                         Hand a secret to the RUNNING pod for <dir>, as a file at
                         /tmp/.agent-secrets/NAME (gone when the pod stops). The value
                         comes from host variable NAME if exported, else from stdin or a
                         silent prompt
-  reset <dir>           Delete the pod's home volume (agent login, caches, history)
+  reset [--home NAME] <dir>
+                        Delete the pod's home volume (agent login, caches, history)
   config                Maintenance shell with ~/.claude mounted READ-WRITE and no
                         project, for installing or updating plugins and skills
   destroy               Remove all agent-pod containers, volumes and images
@@ -51,6 +55,11 @@ the pod; a plain pod and a --godot or --browser pod can run side by side):
   --clean               Do not mount your ~/.claude config or this project's memory
   --login               Pass your Claude login token (from `claude setup-token`) instead
                         of logging in per project; read from AGENT_POD_TOKEN_FILE
+  --detach              (run only) Start the pod in the background with no terminal
+                        and return; default command is `sleep infinity`
+  --home NAME           Use a separate home volume, agent-pod-home-<project>-NAME,
+                        instead of the one shared by this project's pods. For a pod
+                        that must not see another pod's login or ~/.claude.json
   --secret NAME         Pass the host environment variable NAME into the pod; repeat
                         for several. The variable must be set and exported on the host
 
@@ -88,13 +97,22 @@ project_slug() {
     printf '%s-%s\n' "${name%-}" "$hash"
 }
 
+# Home volume for this project, or a separate one when --home NAME is given.
+home_volume() {
+    printf 'agent-pod-home-%s%s\n' "$1" "${OPT_HOME:+-$OPT_HOME}"
+}
+
 # The single source of truth for pod settings. `run` and `verify` both use it,
 # so what verify tests is exactly what run starts.
-# Args: <dir> <slug> <tty: true|false> <name>; reads the OPT_* flags.
+# Args: <dir> <slug> <mode: tty|pipe|detach> <name>; reads the OPT_* flags.
 build_run_args() {
-    local dir="$1" slug="$2" tty="$3" name="$4" git_name git_email
-    RUN_ARGS=( run --rm -i )
-    [[ "$tty" == true ]] && RUN_ARGS+=( -t )
+    local dir="$1" slug="$2" mode="$3" name="$4" git_name git_email
+    case "$mode" in
+        tty)    RUN_ARGS=( run --rm -i -t ) ;;
+        pipe)   RUN_ARGS=( run --rm -i ) ;;
+        detach) RUN_ARGS=( run --rm -d ) ;;
+        *)      die "internal: unknown run mode $mode" ;;
+    esac
     RUN_ARGS+=(
         --name "$name"
         --hostname "agent-pod"
@@ -106,7 +124,7 @@ build_run_args() {
         # and a per-project home volume that holds the agent's own state.
         --read-only
         -v "$dir:/workspace:z"
-        -v "agent-pod-home-$slug:/home/agent"
+        -v "$(home_volume "$slug"):/home/agent"
         # Network: own namespace via pasta, without the gateway-to-host-loopback mapping.
         --network=pasta:--no-map-gw
         # Resources
@@ -237,6 +255,8 @@ parse_opts() {
     OPT_GODOT=false
     OPT_CLEAN=false
     OPT_LOGIN=false
+    OPT_DETACH=false
+    OPT_HOME=""
     OPT_SECRETS=()
     POSITIONAL=()
     while [[ $# -gt 0 ]]; do
@@ -247,6 +267,10 @@ parse_opts() {
             --godot) OPT_GODOT=true ;;
             --clean) OPT_CLEAN=true ;;
             --login) OPT_LOGIN=true ;;
+            --detach) OPT_DETACH=true ;;
+            --home) [[ $# -ge 2 ]] || die "--home needs a name"
+                    OPT_HOME="$2"; shift ;;
+            --home=*) OPT_HOME="${1#--home=}" ;;
             --secret) [[ $# -ge 2 ]] || die "--secret needs a variable name"
                       OPT_SECRETS+=( "$2" ); shift ;;
             --secret=*) OPT_SECRETS+=( "${1#--secret=}" ) ;;
@@ -257,6 +281,7 @@ parse_opts() {
         shift
     done
     [[ "$OPT_BROWSER" == false || "$OPT_GODOT" == false ]] || die "--browser and --godot use separate images and cannot be combined"
+    [[ -z "$OPT_HOME" || "$OPT_HOME" =~ ^[a-z0-9][a-z0-9-]{0,19}$ ]] || die "--home: use 1-20 lowercase letters, digits and dashes"
 }
 
 cmd_build() {
@@ -284,7 +309,20 @@ cmd_run() {
     dir="$(resolve_project "${1:-}")"; shift
     [[ "${1:-}" == "--" ]] && shift
     slug="$(project_slug "$dir")"
-    build_run_args "$dir" "$slug" true "$(pod_name "$slug")"
+    local name mode=tty
+    name="$(pod_name "$slug")"
+    if [[ "$OPT_DETACH" == true ]]; then
+        mode=detach
+        [[ $# -gt 0 ]] || set -- sleep infinity
+    elif [[ ! -t 0 ]]; then
+        die "run: stdin is not a terminal; use --detach (then shell/stop) or run from a terminal"
+    fi
+    build_run_args "$dir" "$slug" "$mode" "$name"
+    if [[ "$mode" == detach ]]; then
+        podman "${RUN_ARGS[@]}" "$(image_for_opts)" "$@" >/dev/null
+        echo "agent-pod: $name is running in the background (home volume $(home_volume "$slug")); use 'shell' and 'stop'" >&2
+        return
+    fi
     exec podman "${RUN_ARGS[@]}" "$(image_for_opts)" "$@"
 }
 
@@ -333,7 +371,7 @@ cmd_verify() {
     read -r -t 5 port4 port6 <&"${LISTENER[0]}" || die "host test listener failed to start"
     [[ "$port4" =~ ^[0-9]+$ ]] || die "host test listener gave no port"
     echo "agent-pod: host listeners on 127.0.0.1:$port4 and [::1]:$port6" >&2
-    build_run_args "$dir" "$slug" false "agent-pod-verify-$slug"
+    build_run_args "$dir" "$slug" pipe "agent-pod-verify-$slug"
     RUN_ARGS+=( -e "VERIFY_HOST_PORT=$port4" -e "VERIFY_HOST_PORT6=$port6" -e "VERIFY_TOKEN=$token" )
     podman "${RUN_ARGS[@]}" "$(image_for_opts)" agent-pod-verify || status=$?
     return "$status"
@@ -353,7 +391,12 @@ cmd_shell() {
     pod="$(pod_name "$(project_slug "$dir")")"
     podman container exists "$pod" || die "no running pod for $dir (start one with 'run' first)"
     [[ $# -gt 0 ]] || set -- /bin/bash -l
-    exec podman exec -it "$pod" "$@"
+    # A terminal gets a terminal; a script or pipe gets plain stdin/stdout, since
+    # `podman exec -t` refuses to run when stdin is not a TTY.
+    if [[ -t 0 && -t 1 ]]; then
+        exec podman exec -it "$pod" "$@"
+    fi
+    exec podman exec -i "$pod" "$@"
 }
 
 cmd_stop() {
@@ -392,8 +435,10 @@ cmd_secret() {
 }
 
 cmd_reset() {
+    parse_opts "$@"
+    set -- "${POSITIONAL[@]}"
     local dir slug; dir="$(resolve_project "${1:-}")"; slug="$(project_slug "$dir")"
-    podman volume rm "agent-pod-home-$slug"
+    podman volume rm "$(home_volume "$slug")"
 }
 
 cmd_destroy() {
