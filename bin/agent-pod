@@ -110,7 +110,9 @@ build_run_args() {
     case "$mode" in
         tty)    RUN_ARGS=( run --rm -i -t ) ;;
         pipe)   RUN_ARGS=( run --rm -i ) ;;
-        detach) RUN_ARGS=( run --rm -d ) ;;
+        # `sleep infinity` ignores SIGTERM, so without a short timeout `stop`
+        # waits 10 s before SIGKILL on every detached pod.
+        detach) RUN_ARGS=( run --rm -d --stop-timeout 2 ) ;;
         *)      die "internal: unknown run mode $mode" ;;
     esac
     RUN_ARGS+=(
@@ -319,6 +321,14 @@ cmd_run() {
     fi
     build_run_args "$dir" "$slug" "$mode" "$name"
     if [[ "$mode" == detach ]]; then
+        # A --rm container whose process was killed from outside Podman is left
+        # behind as Exited/Created and blocks the name; clear it. A running one is
+        # a real conflict.
+        if podman container exists "$name"; then
+            [[ "$(podman inspect --format '{{.State.Running}}' "$name")" != true ]] \
+                || die "$name is already running (use shell/stop)"
+            podman rm -f "$name" >/dev/null
+        fi
         podman "${RUN_ARGS[@]}" "$(image_for_opts)" "$@" >/dev/null
         echo "agent-pod: $name is running in the background (home volume $(home_volume "$slug")); use 'shell' and 'stop'" >&2
         return
