@@ -45,16 +45,20 @@ check_capabilities() {
 }
 
 # Every mount must be one of: the read-only image root, an exact allowlisted
-# path, read-only shared Claude config, or a pseudo/tmpfs filesystem that
+# path (including the --mount directories the launcher declared, read-only
+# unless declared rw), read-only shared Claude config, or a pseudo/tmpfs filesystem that
 # Podman itself creates. A host directory bound anywhere else (even under /tmp
 # or /run), or shared config mounted writable, fails.
 check_mounts() {
     local bad
-    bad="$(awk -v ssh="${SSH_AUTH_SOCK:-}" -v memory="$MEMORY_DIR" '
+    bad="$(awk -v ssh="${SSH_AUTH_SOCK:-}" -v memory="$MEMORY_DIR" -v extra="${AGENT_POD_MOUNTS:-}" '
         BEGIN {
             split("/workspace /home/agent /etc/hosts /etc/hostname /etc/resolv.conf /etc/passwd /etc/group /run/.containerenv", a, " ")
             for (i in a) allowed[a[i]] = 1
             if (ssh != "") allowed[ssh] = 1
+            # --mount directories, as "/mnt/name:ro /mnt/name:rw".
+            n = split(extra, e, " ")
+            for (i = 1; i <= n; i++) { split(e[i], m, ":"); extra_mode[m[1]] = m[2] }
             split("/tmp /var/tmp /run /run/lock /dev /dev/shm", t, " ")
             for (i in t) tmpfs_ok[t[i]] = 1
         }
@@ -62,6 +66,10 @@ check_mounts() {
             root = $4; mp = $5
             for (i = 7; i <= NF; i++) if ($i == "-") { fstype = $(i + 1); break }
             if (mp == "/" || mp in allowed) next
+            if (mp in extra_mode) {
+                if (extra_mode[mp] == "rw" || ("," $6 ",") ~ /,ro,/) next
+                printf "%s (--mount without :rw, but mounted WRITABLE); ", mp; next
+            }
             if (mp == memory) next
             if (mp ~ /^\/home\/agent\/\.claude\//) {
                 if (("," $6 ",") ~ /,ro,/) next
@@ -82,6 +90,27 @@ check_mounts() {
 }
 
 readonly MEMORY_DIR=/home/agent/.claude/projects/-workspace/memory
+
+# Each --mount directory must be present and have the access it was given:
+# a write must fail on a read-only one and succeed on a :rw one.
+check_extra_mounts() {
+    local spec target mode probe targets=""
+    [[ -n "${AGENT_POD_MOUNTS:-}" ]] || return 0
+    for spec in $AGENT_POD_MOUNTS; do
+        target="${spec%:*}"; mode="${spec##*:}"; targets+=" $target"
+        probe="$target/.agent-pod-write-test"
+        if ! awk -v t="$target" '$5 == t {found = 1} END {exit !found}' /proc/self/mountinfo; then
+            fail "--mount $target is not mounted"
+        elif [[ "$mode" == rw ]]; then
+            if touch "$probe" 2>/dev/null; then
+                rm -f "$probe"; pass "--mount $target is mounted read-write"
+            else fail "--mount $target was given :rw but is not writable"; fi
+        elif touch "$probe" 2>/dev/null; then
+            rm -f "$probe"; fail "--mount $target should be read-only but is writable"
+        else pass "--mount $target is mounted read-only"; fi
+    done
+    warn "--mount: the agent can read everything under$targets, and egress is open"
+}
 
 check_host_config() {
     local n
@@ -241,6 +270,7 @@ main() {
     check_identity
     check_capabilities
     check_mounts
+    check_extra_mounts
     check_host_config
     check_readonly_root
     check_runtime_sockets

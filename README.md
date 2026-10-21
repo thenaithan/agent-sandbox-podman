@@ -1,6 +1,6 @@
 # agent-pod
 
-`agent-pod` runs an autonomous coding agent (Claude Code) in a rootless Podman container. From the host, the container gets one project directory and its own per-project state volume, and nothing else. It ships with a check script that tests those limits on your machine, instead of asking you to take them on trust.
+`agent-pod` runs an autonomous coding agent (Claude Code) in a rootless Podman container. From the host, the container gets one project directory and its own per-project state volume, and nothing else unless you name an extra directory with `--mount`. It ships with a check script that tests those limits on your machine, instead of asking you to take them on trust.
 
 > **Status:** early. `verify` passes with the default profile, with `--containers`, with `--browser` (Chrome renders with its own sandbox enabled) and with `--godot` (Godot 4.7.2 runs headless and renders a scene on the pod's virtual display), on one Linux machine with rootless Podman 5 and pasta. `--containers` combined with `--browser` or `--godot` is untested, and `--browser` and `--godot` cannot be combined. Run [Verify](#verify) on yours.
 
@@ -23,6 +23,7 @@ The agent is treated as **untrusted code with your API key**. It may be steered 
 
 **The agent can reach:**
 - the mounted project, read-write, at `/workspace`
+- any extra directories you name with `--mount`, at `/mnt/<name>`, read-only unless you add `:rw`
 - its own home volume, `agent-pod-home-<project>`, which holds its login, history and caches for this one project
 - your Claude Code rules, skills, agents, commands, plugins and `settings.json`, **read-only** (skip with `--clean`)
 - this project's Claude memory (`~/.claude/projects/<project>/memory`), read-write, shared with the host
@@ -33,7 +34,7 @@ The agent is treated as **untrusted code with your API key**. It may be steered 
 
 | Property | How it's enforced | How `verify` checks it |
 |---|---|---|
-| Host filesystem outside the project | the project and the home volume are the only host mounts; dot-dirs in `$HOME` and its ancestors are refused | every mount in `/proc/self/mountinfo` must be on an exact allowlist |
+| Host filesystem outside the project | the project, the home volume and any `--mount` directories are the only host mounts; `$HOME`, its ancestors, dot-dirs in `$HOME` are refused, and for `--mount` also system paths (`/proc`, `/sys`, `/dev`, `/run`, `/tmp/.X11-unix`) | every mount in `/proc/self/mountinfo` must be on an exact allowlist; each `--mount` must be present, and read-only unless given `:rw` (a write is attempted) |
 | Host Podman/Docker socket, other host sockets | never mounted | stats every candidate file (see note below) |
 | Host services on loopback (IPv4 and IPv6) | own network namespace (pasta, `--no-map-gw`) | connects to real listeners on host `127.0.0.1`/`::1` via every route back |
 | Your display, keyboard or screen | no X11/Wayland sockets or variables | socket and env checks |
@@ -59,7 +60,7 @@ Note: GNU `find -type s` misses bind-mounted sockets, because the directory entr
 - **Exfiltration over the network.** Egress is open. Anything in `/workspace` or the agent's context can be sent anywhere. An egress allowlist (proxy or nftables) is the next step.
 - **Your LAN.** The pod can't reach host loopback, but it can reach other machines and the host's LAN address.
 - **Misuse of the credentials you hand it.** The API key, the forwarded SSH agent, and any secrets inside the project.
-- **Persistence inside the project.** The agent can write files that run later *on the host*, when you use the project outside the pod: `.git/hooks`, `.git/config` (`core.fsmonitor`, `core.sshCommand`, aliases), `.envrc`, `.claude/settings.json` hooks, CI config and package scripts. Review diffs, and check these paths in particular.
+- **Persistence inside the project** (and any `--mount ...:rw` directory). The agent can write files that run later *on the host*, when you use the project outside the pod: `.git/hooks`, `.git/config` (`core.fsmonitor`, `core.sshCommand`, aliases), `.envrc`, `.claude/settings.json` hooks, CI config and package scripts. Review diffs, and check these paths in particular.
 - **Kernel or Podman escapes.** This is a container, not a VM; it shares the host kernel. Because of `keep-id`, a breakout lands as your real host user.
 
 ## How it works
@@ -127,6 +128,11 @@ To install or update plugins and skills, run `./bin/agent-pod config`. It's a se
 - **Driving a pod from a script.** `run --detach <dir>` starts the pod in the background with no terminal (default command `sleep infinity`) and returns; `shell <dir> -- cmd` then runs commands in it, passing stdin and stdout through when there is no terminal, so `echo prompt | agent-pod shell <dir> -- claude -p` works from any program. `stop <dir>` ends it. A plain `run` without a terminal refuses to start instead of leaving Podman to fail.
 - `agent-pod shell <dir>` opens another bash terminal in the pod that `run` started, for example to watch the agent's work or run a command while it works. It joins the same container, so the user, mounts, limits and environment are identical, and it grants no extra access. Add `-- cmd` to run one command instead of a shell. It needs a running pod, so `run` first.
 - `agent-pod secret <dir> NAME` hands a secret to a pod that is already running, for when you need one halfway through a session. The value comes from the host variable `NAME` if it's exported, otherwise from stdin or a silent prompt. It lands as a file at `/tmp/.agent-secrets/NAME` (mode 600, directory 700) on the pod's tmpfs, so it disappears when the pod stops. A running process can't gain environment variables, so tell the agent to read it: `export NAME=$(cat /tmp/.agent-secrets/NAME)`. The same trade-off as `--secret` applies: the agent can read it.
+- `--mount DIR[:ro|:rw]` also mounts a host directory, at `/mnt/<basename of DIR>`, for a project that needs a sibling library, a dataset or reference docs. It is read-only unless you add `:rw`. Repeat it for several: `--mount ~/projects/shared-lib --mount ~/data/fixtures:rw`.
+  - Each directory gets the same checks as the project: `/`, `$HOME` and its ancestors, dot-directories in `$HOME` and system paths (`/proc`, `/sys`, `/dev`, `/run`, `/tmp/.X11-unix`) are refused, except removable drives under `/run/media/<user>`. It may not overlap the project or another `--mount`, and two directories with the same basename are refused rather than renamed.
+  - It is relabelled for SELinux like the project (`:z`). The new label stays on the host, so don't mount a directory that a host service also reads (a web root under `/srv`, say). The mount is a plain bind, so anything mounted inside the directory on the host (a USB drive, an sshfs share) does not appear in the pod.
+  - `verify --mount ...` allows exactly these mount points, and checks that a write fails on a read-only one and succeeds on a `:rw` one.
+  - The agent can read everything you mount and, because egress is open, send it anywhere. A `:rw` directory is open to the same persistence risks as the project (see below), so prefer read-only.
 - `--clean` mounts none of your `~/.claude` config or memory. Use it for a project you trust less than usual.
 - `--ssh` forwards your SSH agent. The pod can *use* every loaded key while it runs, though it can't read them. Load only the key you need (`ssh-add -t 1h ~/.ssh/deploy_key`).
 - `--containers` lets the agent run its own rootless Podman inside the pod, for projects that need containers. Nested images live in the project's home volume, and the host socket is still never mounted. **The profile gets weaker:**
@@ -140,7 +146,7 @@ The host needs a subuid range of at least 65,536. `verify --containers` reports 
 
 ## Verify
 
-`agent-pod verify [--containers] [--browser|--godot] <dir>` builds its pod arguments with the same function `run` uses. The only differences are no TTY, a different container name and two extra environment variables. Before starting the pod, it opens accept-and-close listeners (no HTTP, nothing served) on host `127.0.0.1` and `::1`. It then runs [`agent-pod-verify`](bin/agent-pod-verify) inside the pod. The checks are written to fail when in doubt, and the exit code is the number of failures.
+`agent-pod verify [--containers] [--browser|--godot] [--mount DIR[:rw]]... <dir>` builds its pod arguments with the same function `run` uses. The only differences are no TTY, a different container name and two extra environment variables. Before starting the pod, it opens accept-and-close listeners (no HTTP, nothing served) on host `127.0.0.1` and `::1`. It then runs [`agent-pod-verify`](bin/agent-pod-verify) inside the pod. The checks are written to fail when in doubt, and the exit code is the number of failures.
 
 Output on the author's machine (default mode; gateway addresses replaced):
 

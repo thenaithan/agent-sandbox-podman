@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # agent-pod: run a coding agent in a rootless Podman container that can see
-# one project directory and nothing else from the host.
+# one project directory (plus any you name with --mount) and nothing else from
+# the host.
 set -euo pipefail
 
 readonly IMAGE_NAME="${AGENT_POD_IMAGE:-localhost/agent-pod}"
@@ -62,6 +63,9 @@ the pod; a plain pod and a --godot or --browser pod can run side by side):
                         that must not see another pod's login or ~/.claude.json
   --secret NAME         Pass the host environment variable NAME into the pod; repeat
                         for several. The variable must be set and exported on the host
+  --mount DIR[:ro|:rw]  Also mount the host directory DIR at /mnt/<basename of DIR>,
+                        read-only unless :rw is given; repeat for several. DIR gets
+                        the same checks as the project and may not overlap it
 
 Environment:
   AGENT_POD_MEMORY (8g)  AGENT_POD_CPUS (4)  AGENT_POD_PIDS (1024)
@@ -86,6 +90,67 @@ resolve_project() {
         "$home"/.*) die "refusing to mount $dir: dot-directories in \$HOME often hold credentials" ;;
     esac
     printf '%s\n' "$dir"
+}
+
+# Host paths that hold kernel interfaces, devices or runtime sockets (the
+# Podman socket lives under /run/user, X11 under /tmp/.X11-unix). No --mount
+# directory may be, or contain, one of these. Removable drives under
+# /run/media/<user> are allowed.
+readonly SYSTEM_DIRS=( /proc /sys /dev /run /var/run /tmp/.X11-unix )
+
+check_not_system_dir() {
+    local dir="$1" sys
+    [[ "$dir" != /run/media/*/* ]] || return 0
+    for sys in "${SYSTEM_DIRS[@]}"; do
+        if paths_overlap "$dir" "$sys"; then
+            die "refusing to mount $dir: it is or contains $sys (kernel interfaces, devices or runtime sockets)"
+        fi
+    done
+}
+
+# True when one path is the other or an ancestor of it.
+paths_overlap() {
+    [[ "$1" == "$2" || "$1" == "$2"/* || "$2" == "$1"/* ]]
+}
+
+# Extra host directories from --mount, each at /mnt/<name>, read-only unless
+# the spec ends in :rw. Each one gets the project's checks, may not overlap the
+# project or another --mount, and needs a unique name. The list goes to the pod
+# as AGENT_POD_MOUNTS, so verify knows exactly which mounts to allow.
+add_mount_args() {
+    local project="$1" spec mode dir name target seen_dirs=() seen_names=() other list=""
+    for spec in "${OPT_MOUNTS[@]}"; do
+        mode=ro
+        case "$spec" in
+            *:ro) spec="${spec%:ro}" ;;
+            *:rw) spec="${spec%:rw}"; mode=rw ;;
+        esac
+        [[ -n "$spec" ]] || die "--mount needs a directory"
+        dir="$(resolve_project "$spec")"
+        check_not_system_dir "$dir"
+        [[ "$dir" != *[:,]* ]] || die "--mount: $dir contains ':' or ',', which Podman cannot mount"
+        ! paths_overlap "$dir" "$project" || die "--mount: $dir overlaps the project $project"
+        for other in "${seen_dirs[@]}"; do
+            ! paths_overlap "$dir" "$other" || die "--mount: $dir overlaps --mount $other"
+        done
+        name="$(basename "$dir" | tr -c 'a-zA-Z0-9_.-' '-' | cut -c1-40)"
+        name="${name%-}"
+        for other in "${seen_names[@]}"; do
+            [[ "$name" != "$other" ]] || die "--mount: two directories would both mount at /mnt/$name"
+        done
+        seen_dirs+=( "$dir" ); seen_names+=( "$name" )
+        target="/mnt/$name"
+        # A plain bind, not Podman's default rbind, so anything mounted inside
+        # DIR on the host (a USB drive, an sshfs share) stays out of the pod.
+        if [[ "$mode" == rw ]]; then
+            echo "agent-pod: $dir is mounted READ-WRITE at $target" >&2
+            RUN_ARGS+=( -v "$dir:$target:bind,z" )
+        else
+            RUN_ARGS+=( -v "$dir:$target:ro,bind,z" )
+        fi
+        list+="${list:+ }$target:$mode"
+    done
+    RUN_ARGS+=( -e "AGENT_POD_MOUNTS=$list" )
 }
 
 # Stable per-project name: basename plus a short hash of the full path, so two
@@ -123,7 +188,8 @@ build_run_args() {
         --userns=keep-id:uid=1000,gid=1000
         --cap-drop=ALL
         # Filesystem: read-only image, tmpfs for /tmp and /run, one project mount,
-        # and a per-project home volume that holds the agent's own state.
+        # and a per-project home volume that holds the agent's own state. Extra
+        # directories come only from --mount (add_mount_args).
         --read-only
         -v "$dir:/workspace:z"
         -v "$(home_volume "$slug"):/home/agent"
@@ -133,6 +199,7 @@ build_run_args() {
         --memory "$MEMORY" --cpus "$CPUS" --pids-limit "$PIDS"
         --workdir /workspace
     )
+    [[ ${#OPT_MOUNTS[@]} -eq 0 ]] || add_mount_args "$dir"
     [[ "$OPT_CLEAN" == true ]] || add_claude_config_args "$dir"
     if [[ "$OPT_BROWSER" == true ]]; then
         # Chrome's sandbox chroots itself to drop filesystem access, and Podman's
@@ -260,6 +327,7 @@ parse_opts() {
     OPT_DETACH=false
     OPT_HOME=""
     OPT_SECRETS=()
+    OPT_MOUNTS=()
     POSITIONAL=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -276,6 +344,9 @@ parse_opts() {
             --secret) [[ $# -ge 2 ]] || die "--secret needs a variable name"
                       OPT_SECRETS+=( "$2" ); shift ;;
             --secret=*) OPT_SECRETS+=( "${1#--secret=}" ) ;;
+            --mount) [[ $# -ge 2 ]] || die "--mount needs a directory"
+                     OPT_MOUNTS+=( "$2" ); shift ;;
+            --mount=*) OPT_MOUNTS+=( "${1#--mount=}" ) ;;
             --) POSITIONAL+=( "$@" ); break ;;
             -*) die "unknown option: $1" ;;
             *) POSITIONAL+=( "$1" ) ;;
