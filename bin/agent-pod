@@ -13,9 +13,11 @@ readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Shared Claude Code config, mounted read-only so the agent can use your rules,
 # skills, agents and plugins but cannot rewrite them for every later session.
+# settings.json is not here: add_claude_config_args mounts it at a side path
+# and agent-pod-init copies it into place, so Claude Code can save settings.
 readonly CLAUDE_SHARED=(
     agents commands rules skills plugins hooks scripts ecc mcp-configs .agents
-    settings.json CLAUDE.md AGENTS.md plugin.json marketplace.json
+    CLAUDE.md AGENTS.md plugin.json marketplace.json
 )
 
 die() { echo "agent-pod: $*" >&2; exit 1; }
@@ -258,6 +260,9 @@ add_claude_config_args() {
         [[ -e "$HOME/.claude/$item" ]] || continue
         RUN_ARGS+=( -v "$HOME/.claude/$item:/home/agent/.claude/$item:ro" )
     done
+    if [[ -f "$HOME/.claude/settings.json" ]]; then
+        RUN_ARGS+=( -v "$HOME/.claude/settings.json:/home/agent/.claude/.host-settings.json:ro" )
+    fi
     memdir="$HOME/.claude/projects/$(printf '%s' "$dir" | tr -c 'a-zA-Z0-9' '-')/memory"
     mkdir -p "$memdir"
     RUN_ARGS+=(

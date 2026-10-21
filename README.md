@@ -25,7 +25,7 @@ The agent is treated as **untrusted code with your API key**. It may be steered 
 - the mounted project, read-write, at `/workspace`
 - any extra directories you name with `--mount`, at `/mnt/<name>`, read-only unless you add `:rw`
 - its own home volume, `agent-pod-home-<project>`, which holds its login, history and caches for this one project
-- your Claude Code rules, skills, agents, commands, plugins and `settings.json`, **read-only** (skip with `--clean`)
+- your Claude Code rules, skills, agents, commands and plugins, **read-only**, and a copy of your `settings.json` (skip with `--clean`)
 - this project's Claude memory (`~/.claude/projects/<project>/memory`), read-write, shared with the host
 - the internet and your LAN (egress is not filtered; see below)
 - your SSH agent, but only with `--ssh`
@@ -101,7 +101,7 @@ Requirements:
 
 Log in once per project inside the pod, or export `ANTHROPIC_API_KEY` on the host and it is passed through. The login is kept in that project's volume, so it survives restarts until you run `reset`. Your host login is never shared, because `~/.claude/.credentials.json` and `~/.claude.json` hold your account tokens and the history of every project. On a project's first start, the pod writes a minimal `~/.claude.json` (onboarding done, nothing else), so you go straight to login instead of the first-run setup.
 
-**Your Claude Code setup comes with you.** The pod mounts your rules, skills, agents, commands, plugins and `settings.json` from `~/.claude`, read-only. A prompt-injected agent can use them but cannot plant instructions or hooks in them that would run in every later session. Your memory for *this* project is mounted read-write, at the same host path Claude Code uses, so memories carry over between the host and the pod. The agent can already write to this project, so that adds no new reach. Login, history and caches stay in the project's own volume.
+**Your Claude Code setup comes with you.** The pod mounts your rules, skills, agents, commands and plugins from `~/.claude`, read-only. `settings.json` is copied in fresh at every start instead of being mounted, so `/effort`, `/model` and `/config` can save inside the pod. Those changes last until the pod stops and never reach your host file. A prompt-injected agent can use them but cannot plant instructions or hooks in them that would run in every later session. Your memory for *this* project is mounted read-write, at the same host path Claude Code uses, so memories carry over between the host and the pod. The agent can already write to this project, so that adds no new reach. Login, history and caches stay in the project's own volume.
 
 To install or update plugins and skills, run `./bin/agent-pod config`. It's a separate maintenance pod with `~/.claude` mounted read-write and no project mounted, so nothing untrusted is read while your config is writable.
 

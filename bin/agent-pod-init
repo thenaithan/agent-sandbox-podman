@@ -4,4 +4,20 @@
 # only (no account, tokens or project history); login stays per project.
 set -euo pipefail
 [[ -e "$HOME/.claude.json" ]] || install -m 0600 /etc/agent-pod/claude-seed.json "$HOME/.claude.json"
+
+# Host settings.json arrives read-only at a side path, not over settings.json
+# itself: Claude Code saves settings by renaming a temp file over it, which
+# fails with EBUSY on a mount point (/effort, /model, /config). Copy it into
+# place on every start, so changes made in the pod last until the pod stops
+# and the host file stays the source of truth. The marker lets a later
+# --clean start remove a copy left in the volume.
+host_settings="$HOME/.claude/.host-settings.json"
+marker="$HOME/.claude/.settings-from-host"
+if [[ -f "$host_settings" ]]; then
+    install -d -m 0700 "$HOME/.claude"
+    install -m 0600 "$host_settings" "$HOME/.claude/settings.json"
+    : > "$marker"
+elif [[ -e "$marker" ]]; then
+    rm -f "$HOME/.claude/settings.json" "$marker"
+fi
 exec "$@"

@@ -120,6 +120,12 @@ check_host_config() {
     if [[ -O /home/agent/.claude && -w /home/agent/.claude/projects/-workspace ]]; then
         pass "agent owns ~/.claude (sessions and login can be written)"
     else fail "~/.claude or projects/-workspace not writable by the agent; run 'agent-pod reset <dir>'"; fi
+    # A mount over settings.json makes every settings save fail with EBUSY.
+    if awk '$5 == "/home/agent/.claude/settings.json" {found = 1} END {exit !found}' /proc/self/mountinfo; then
+        fail "~/.claude/settings.json is a mount point; Claude Code cannot save settings (/effort, /model)"
+    elif [[ -e /home/agent/.claude/.host-settings.json && ! -w /home/agent/.claude/settings.json ]]; then
+        fail "~/.claude/settings.json was not copied from the host or is not writable"
+    else pass "~/.claude/settings.json is a writable copy (saves last until the pod stops)"; fi
     if touch "$MEMORY_DIR/.agent-pod-write-test" 2>/dev/null; then
         rm -f "$MEMORY_DIR/.agent-pod-write-test"; pass "project memory is writable (shared with host)"
     else fail "project memory is not writable: $MEMORY_DIR"; fi
