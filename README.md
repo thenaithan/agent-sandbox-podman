@@ -2,7 +2,7 @@
 
 `agent-pod` runs an autonomous coding agent (Claude Code) in a rootless Podman container. From the host, the container gets one project directory and its own per-project state volume, and nothing else unless you name an extra directory with `--mount`. It ships with a check script that tests those limits on your machine, instead of asking you to take them on trust.
 
-> **Status:** early. `verify` passes with the default profile, with `--containers`, with `--browser` (Chrome renders with its own sandbox enabled) and with `--godot` (Godot 4.7.2 runs headless and renders a scene on the pod's virtual display), on one Linux machine with rootless Podman 5 and pasta. `--containers` combined with `--browser` or `--godot` is untested, and `--browser` and `--godot` cannot be combined. Run [Verify](#verify) on yours.
+> **Status:** early. `verify` passes with the default profile, with `--containers`, with `--browser` (Chrome renders with its own sandbox enabled) and with `--godot` (Godot 4.7.2 runs headless and renders a scene on the pod's virtual display), on one Linux machine with rootless Podman 5 and pasta. [@CjvdeG](https://github.com/CjvdeG) reports the default profile passing on Podman 4.9.3 (Ubuntu, pasta). `--containers` combined with `--browser` or `--godot` is untested, and `--browser` and `--godot` cannot be combined. Run [Verify](#verify) on yours.
 
 ## Why
 
@@ -61,6 +61,7 @@ Note: GNU `find -type s` misses bind-mounted sockets, because the directory entr
 - **Your LAN.** The pod can't reach host loopback, but it can reach other machines and the host's LAN address.
 - **Misuse of the credentials you hand it.** The API key, the forwarded SSH agent, and any secrets inside the project.
 - **Persistence inside the project** (and any `--mount ...:rw` directory). The agent can write files that run later *on the host*, when you use the project outside the pod: `.git/hooks`, `.git/config` (`core.fsmonitor`, `core.sshCommand`, aliases), `.envrc`, `.claude/settings.json` hooks, CI config and package scripts. Review diffs, and check these paths in particular.
+- **Planted memories.** This project's Claude memory is shared read-write with the host, and Claude Code on the host loads it automatically. A prompt-injected agent can write a "memory" that steers your next host session on this project. It is the same class of risk as a malicious `CLAUDE.md` in the repo. Check `~/.claude/projects/<project>/memory` after a session you don't trust, or use `--clean`. (Reported by [@CjvdeG](https://github.com/CjvdeG).)
 - **Kernel or Podman escapes.** This is a container, not a VM; it shares the host kernel. Because of `keep-id`, a breakout lands as your real host user.
 
 ## How it works
@@ -83,7 +84,7 @@ Note: GNU `find -type s` misses bind-mounted sockets, because the directory entr
 ## Usage
 
 Requirements:
-- Linux with rootless Podman 5+ and pasta (`passt`)
+- Linux with rootless Podman 5+ and pasta (`passt`); Podman 4.9.3 on Ubuntu is reported to work
 - cgroup v2, with CPU and memory controllers delegated to your user (`cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers` should list `cpu memory pids`)
 - `python3` on the host, for `verify`'s test listeners
 - for `--containers` only: a subuid range of at least 65,536 (`grep "^$USER:" /etc/subuid`)
@@ -101,7 +102,7 @@ Requirements:
 
 Log in once per project inside the pod, or export `ANTHROPIC_API_KEY` on the host and it is passed through. The login is kept in that project's volume, so it survives restarts until you run `reset`. Your host login is never shared, because `~/.claude/.credentials.json` and `~/.claude.json` hold your account tokens and the history of every project. On a project's first start, the pod writes a minimal `~/.claude.json` (onboarding done, nothing else), so you go straight to login instead of the first-run setup.
 
-**Your Claude Code setup comes with you.** The pod mounts your rules, skills, agents, commands and plugins from `~/.claude`, read-only. `settings.json` is copied in fresh at every start instead of being mounted, so `/effort`, `/model` and `/config` can save inside the pod. Those changes last until the pod stops and never reach your host file. A prompt-injected agent can use them but cannot plant instructions or hooks in them that would run in every later session. Your memory for *this* project is mounted read-write, at the same host path Claude Code uses, so memories carry over between the host and the pod. The agent can already write to this project, so that adds no new reach. Login, history and caches stay in the project's own volume.
+**Your Claude Code setup comes with you.** The pod mounts your rules, skills, agents, commands and plugins from `~/.claude`, read-only. `settings.json` is copied in fresh at every start instead of being mounted, so `/effort`, `/model` and `/config` can save inside the pod. Those changes last until the pod stops and never reach your host file. A prompt-injected agent can use them but cannot plant instructions or hooks in them that would run in every later session. Your memory for *this* project is mounted read-write, at the same host path Claude Code uses, so memories carry over between the host and the pod. The agent can already write to this project, so that adds no new reach, but it can plant memories your host sessions will load (see [What this does not protect against](#what-this-does-not-protect-against)). Login, history and caches stay in the project's own volume.
 
 To install or update plugins and skills, run `./bin/agent-pod config`. It's a separate maintenance pod with `~/.claude` mounted read-write and no project mounted, so nothing untrusted is read while your config is writable.
 
